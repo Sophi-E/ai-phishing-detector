@@ -1,6 +1,7 @@
 import re
 import os
 import ssl
+import json
 import socket
 import whois
 import dns.resolver
@@ -9,6 +10,7 @@ from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from functools import lru_cache
 
 load_dotenv()
 VT_API_KEY = os.getenv("VT_API_KEY")
@@ -17,9 +19,18 @@ IPINFO_API_KEY = os.getenv("IPINFO_API_KEY")
 DEFAULT_TIMEOUT = 7
 UA = {"User-Agent": "Mozilla/5.0 (PhishingDetector/1.0)"}
 
+BAD_ASNS_PATH = os.path.join(os.path.dirname(__file__), "bad_asns.json")
+if os.path.exists(BAD_ASNS_PATH):
+    with open(BAD_ASNS_PATH) as f:
+        BAD_ASNS = json.load(f)
+else:
+    BAD_ASNS = {}
+
 def _ensure_scheme(url: str) -> str:
+    if isinstance(url, bytes):
+        url = url.decode("utf-8", errors="ignore")
     if not re.match(r'^https?://', url, flags=re.I):
-        return "http://" + url
+        url = "http://" + url
     return url
 
 def _domain(url: str) -> str:
@@ -416,37 +427,139 @@ def Statistical_report(url: str) -> int:
         return 1
     return -1
 
-def extract_features(url: str):
+@lru_cache(maxsize=500)
+def get_virustotal_data(url: str) -> dict:
+    try:
+        headers = {"x-apikey": VT_API_KEY}
+        resp = requests.post(
+            "https://www.virustotal.com/api/v3/urls",
+            headers=headers,
+            data={"url": url}
+        )
+        if resp.status_code != 200:
+            return {"error": f"VT submission failed: {resp.text}"}
+
+        analysis_id = resp.json()["data"]["id"]
+        report = requests.get(
+            f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+            headers=headers
+        )
+        if report.status_code != 200:
+            return {"error": f"VT analysis failed: {report.text}"}
+
+        stats = report.json()["data"]["attributes"]["stats"]
+        return stats
+    except Exception as e:
+        return {"error": str(e)}
+
+# --- IPinfo check ---
+@lru_cache(maxsize=500)
+def get_ipinfo_data(url: str) -> dict:
+    try:
+        parsed = urlparse(_ensure_scheme(url))
+        ip = socket.gethostbyname(parsed.netloc)
+        headers = {"Authorization": f"Bearer {IPINFO_API_KEY}"}
+        resp = requests.get(f"https://ipinfo.io/{ip}/json", headers=headers)
+        if resp.status_code != 200:
+            return {"error": f"IPinfo failed: {resp.text}"}
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+# --- IPinfo risk scoring (used by app) ---
+def check_ipinfo_risk(ipinfo_data):
+    score = 0
+    notes = []
+    if not ipinfo_data or "error" in ipinfo_data:
+        return score, ["No IPinfo data"]
+
+    asn = ipinfo_data.get("asn", {}).get("asn", "")
+    org = ipinfo_data.get("org", "")
+    country = ipinfo_data.get("country", "")
+
+    if asn in BAD_ASNS:
+        score += 10
+        notes.append(f"ASN {asn} flagged: {BAD_ASNS[asn]}")
+
+    if "VPS" in org.upper() or "CLOUD" in org.upper():
+        score += 5
+        notes.append(f"Suspicious org: {org}")
+
+    risky_countries = ["SC", "PA", "VG", "RU", "CN", "KP", "IR", "SY"]
+    if country in risky_countries:
+        score += 5
+        notes.append(f"High-risk country: {country}")
+
+    return score, notes
+
+
+def extract_features(url: str) -> dict:
     url = _ensure_scheme(url)
-    return [
-        having_IP_Address(url),
-        URL_Length(url),
-        Shortining_Service(url),
-        having_At_Symbol(url),
-        double_slash_redirecting(url),
-        Prefix_Suffix(url),
-        having_Sub_Domain(url),
-        SSLfinal_State(url),
-        Domain_registeration_length(url),
-        Favicon(url),
-        port(url),
-        HTTPS_token(url),
-        Request_URL(url),
-        URL_of_Anchor(url),
-        Links_in_tags(url),
-        SFH(url),
-        Submitting_to_email(url),
-        Abnormal_URL(url),
-        Redirect(url),
-        on_mouseover(url),
-        RightClick(url),
-        popUpWidnow(url),
-        Iframe(url),
-        age_of_domain(url),
-        DNSRecord(url),
-        web_traffic(url),
-        Page_Rank(url),
-        Google_Index(url),
-        Links_pointing_to_page(url),
-        Statistical_report(url),
-    ]
+    parsed = urlparse(url)
+    features = {}
+
+    features["having_IP_Address"] = 1 if re.match(r"\d+\.\d+\.\d+\.\d+", parsed.netloc) else -1
+    features["URL_Length"] = 1 if len(url) < 54 else -1
+    features["Shortining_Service"] = 1 if "bit.ly" not in url and "tinyurl" not in url else -1
+    features["having_At_Symbol"] = -1 if "@" in url else 1
+    features["double_slash_redirecting"] = -1 if url.count("//") > 1 else 1
+    features["Prefix_Suffix"] = -1 if "-" in parsed.netloc else 1
+    features["having_Sub_Domain"] = -1 if parsed.netloc.count(".") > 3 else 1
+    features["SSLfinal_State"] = -1 if _ssl_valid(parsed.netloc) else 1
+    features["Domain_registeration_length"] = -1 if _whois(parsed.netloc) and getattr(_whois(parsed.netloc), "expiration_date", None) else 1
+    features["Favicon"] = 1
+    features["port"] = -1 if ":" in parsed.netloc and parsed.netloc.split(":")[-1] not in ("80", "443") else 1
+    features["HTTPS_token"] = -1 if "https" in parsed.netloc.lower() else 1
+    features["Request_URL"] = Request_URL(url)
+    features["URL_of_Anchor"] = URL_of_Anchor(url)
+    features["Links_in_tags"] = Links_in_tags(url)
+    features["SFH"] = SFH(url)
+    features["Submitting_to_email"] = Submitting_to_email(url)
+    features["Abnormal_URL"] = Abnormal_URL(url)
+    features["Redirect"] = Redirect(url)
+    features["on_mouseover"] = on_mouseover(url)
+    features["RightClick"] = RightClick(url)
+    features["popUpWidnow"] = popUpWidnow(url)
+    features["Iframe"] = Iframe(url)
+    features["age_of_domain"] = age_of_domain(url)
+    features["DNSRecord"] = DNSRecord(url)
+    features["web_traffic"] = web_traffic(url)
+    features["Page_Rank"] = Page_Rank(url)
+    features["Google_Index"] = Google_Index(url)
+    features["Links_pointing_to_page"] = Links_pointing_to_page(url)
+    features["Statistical_report"] = 1
+
+    return features
+
+    # return [
+    #     having_IP_Address(url),
+    #     URL_Length(url),
+    #     Shortining_Service(url),
+    #     having_At_Symbol(url),
+    #     double_slash_redirecting(url),
+    #     Prefix_Suffix(url),
+    #     having_Sub_Domain(url),
+    #     SSLfinal_State(url),
+    #     Domain_registeration_length(url),
+    #     Favicon(url),
+    #     port(url),
+    #     HTTPS_token(url),
+    #     Request_URL(url),
+    #     URL_of_Anchor(url),
+    #     Links_in_tags(url),
+    #     SFH(url),
+    #     Submitting_to_email(url),
+    #     Abnormal_URL(url),
+    #     Redirect(url),
+    #     on_mouseover(url),
+    #     RightClick(url),
+    #     popUpWidnow(url),
+    #     Iframe(url),
+    #     age_of_domain(url),
+    #     DNSRecord(url),
+    #     web_traffic(url),
+    #     Page_Rank(url),
+    #     Google_Index(url),
+    #     Links_pointing_to_page(url),
+    #     Statistical_report(url),
+    # ]
