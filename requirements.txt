@@ -1,0 +1,16 @@
+# Core
+pandas
+numpy
+scikit-learn
+joblib
+
+# Web app
+streamlit
+
+# Networking & APIs
+requests
+python-dotenv
+
+# Optional: for visualizations if you later add explainability
+matplotlib
+seaborn
